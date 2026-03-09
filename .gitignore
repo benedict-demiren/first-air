@@ -1,0 +1,25 @@
+# Build output
+build/
+cmake-build-*/
+
+# Generated Faust C++ (regenerated from .dsp)
+generated/FirstAirDSP.h
+
+# IDE files
+.vscode/
+.idea/
+*.xcworkspace/
+*.xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+
+# macOS
+.DS_Store
+._*
+
+# Precompiled headers
+*.pch
+*.gch
