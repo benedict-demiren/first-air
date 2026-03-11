@@ -46,20 +46,19 @@ static juce::String midiNoteToName(int note)
 
 void RoomVisualizationComponent::paint(juce::Graphics& g)
 {
-    g.fillAll(juce::Colour(0xff080808));  // Near-black, slightly lighter for contrast
+    g.fillAll(juce::Colour(0xff080808));
 
     auto bounds = getLocalBounds().toFloat().reduced(8.0f);
     float cx = bounds.getCentreX();
-    float cy = bounds.getCentreY() + bounds.getHeight() * 0.1f;  // Shift down slightly
+    float cy = bounds.getCentreY() + bounds.getHeight() * 0.1f;
 
-    // Read room dimensions from zone pointers (safe: aligned float read is atomic)
     float length = roomLengthZone ? *roomLengthZone : 8.0f;
     float width  = roomWidthZone  ? *roomWidthZone  : 5.0f;
     float height = roomHeightZone ? *roomHeightZone : 3.5f;
     float skew   = roomSkewZone   ? *roomSkewZone   : 0.0f;
     float curve  = roomCurveZone  ? *roomCurveZone  : 0.0f;
+    float energy = energyZone     ? *energyZone      : 0.0f;
 
-    // Source and listener positions (0-1 normalized)
     float sX = srcXZone ? *srcXZone : 0.5f;
     float sY = srcYZone ? *srcYZone : 0.3f;
     float sZ = srcZZone ? *srcZZone : 0.5f;
@@ -67,38 +66,66 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
     float lY = lisYZone ? *lisYZone : 0.7f;
     float lZ = lisZZone ? *lisZZone : 0.5f;
 
-    // Calculate scale to fit room in bounds
     float maxDim = std::max({length, width, height});
     float availableSize = std::min(bounds.getWidth(), bounds.getHeight()) * 0.55f;
     float scale = availableSize / (maxDim + 0.01f);
 
-    // Normalize room dims to centered coordinates
-    float hw = width * 0.5f;   // half-width (x axis)
-    float hl = length * 0.5f;  // half-length (y axis)
-    float hh = height;          // full height (z axis, 0 at floor)
+    float hw = width * 0.5f;
+    float hl = length * 0.5f;
+    float hh = height;
 
-    // Skew offset: top face shifts relative to bottom
     float skewOffset = (skew / 100.0f) * hw * 0.5f;
 
-    // --- Draw room wireframe ---
-    // 8 corners of the room box
-    // Bottom face (z=0): 4 corners
-    auto b0 = project(-hw, -hl, 0, scale, cx, cy);  // front-left
-    auto b1 = project( hw, -hl, 0, scale, cx, cy);  // front-right
-    auto b2 = project( hw,  hl, 0, scale, cx, cy);  // back-right
-    auto b3 = project(-hw,  hl, 0, scale, cx, cy);  // back-left
+    // Curvature: positive bows outward (focusing), negative inward (scattering)
+    float bowAmt = (curve / 100.0f) * maxDim * 0.20f;
 
-    // Top face (z=height): 4 corners, shifted by skew
+    // Energy glow: map 0-100% energy to a warm glow colour
+    float enorm = std::clamp(energy / 100.0f, 0.0f, 1.0f);
+    auto glowColour = juce::Colour::fromFloatRGBA(
+        1.0f, 0.4f + enorm * 0.3f, 0.1f + enorm * 0.1f, enorm * 0.35f);
+    auto edgeGlow = juce::Colour::fromFloatRGBA(
+        0.3f + enorm * 0.7f, 0.4f + enorm * 0.2f, 0.5f + enorm * 0.1f, 1.0f);
+
+    // 8 corners
+    auto b0 = project(-hw, -hl, 0, scale, cx, cy);
+    auto b1 = project( hw, -hl, 0, scale, cx, cy);
+    auto b2 = project( hw,  hl, 0, scale, cx, cy);
+    auto b3 = project(-hw,  hl, 0, scale, cx, cy);
     auto t0 = project(-hw + skewOffset, -hl, hh, scale, cx, cy);
     auto t1 = project( hw + skewOffset, -hl, hh, scale, cx, cy);
     auto t2 = project( hw + skewOffset,  hl, hh, scale, cx, cy);
     auto t3 = project(-hw + skewOffset,  hl, hh, scale, cx, cy);
 
-    // Edge color
-    auto edgeColour = juce::Colour(0xff446688);
-    g.setColour(edgeColour.withAlpha(0.3f));
+    // Helper: draw a curved edge between two 3D points with bow perpendicular to edge
+    auto drawCurvedEdge = [&](juce::Point<float> p0, juce::Point<float> p1,
+                              juce::Point<float> ctrl, float thickness) {
+        juce::Path p;
+        p.startNewSubPath(p0);
+        if (std::abs(curve) > 2.0f)
+            p.quadraticTo(ctrl, p1);
+        else
+            p.lineTo(p1);
+        g.strokePath(p, juce::PathStrokeType(thickness));
+    };
 
-    // Fill faces for depth perception (back faces slightly visible)
+    // Control points for curved edges (midpoints bowed outward/inward)
+    // Bottom face
+    auto cb01 = project(0, -hl - bowAmt, 0, scale, cx, cy);            // front
+    auto cb12 = project(hw + bowAmt, 0, 0, scale, cx, cy);             // right
+    auto cb23 = project(0, hl + bowAmt, 0, scale, cx, cy);             // back
+    auto cb30 = project(-hw - bowAmt, 0, 0, scale, cx, cy);            // left
+    // Top face
+    auto ct01 = project(skewOffset, -hl - bowAmt, hh, scale, cx, cy);
+    auto ct12 = project(hw + bowAmt + skewOffset, 0, hh, scale, cx, cy);
+    auto ct23 = project(skewOffset, hl + bowAmt, hh, scale, cx, cy);
+    auto ct30 = project(-hw - bowAmt + skewOffset, 0, hh, scale, cx, cy);
+    // Vertical edges
+    auto cv0 = project(-hw - bowAmt * 0.5f + skewOffset * 0.5f, -hl - bowAmt * 0.5f, hh * 0.5f, scale, cx, cy);
+    auto cv1 = project( hw + bowAmt * 0.5f + skewOffset * 0.5f, -hl - bowAmt * 0.5f, hh * 0.5f, scale, cx, cy);
+    auto cv2 = project( hw + bowAmt * 0.5f + skewOffset * 0.5f,  hl + bowAmt * 0.5f, hh * 0.5f, scale, cx, cy);
+    auto cv3 = project(-hw - bowAmt * 0.5f + skewOffset * 0.5f,  hl + bowAmt * 0.5f, hh * 0.5f, scale, cx, cy);
+
+    // --- Fill faces (with energy glow overlay) ---
     // Floor
     {
         juce::Path floor;
@@ -106,17 +133,17 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
         floor.closeSubPath();
         g.setColour(juce::Colour(0xff0f0f1a).withAlpha(0.6f));
         g.fillPath(floor);
+        if (enorm > 0.01f) { g.setColour(glowColour.withAlpha(enorm * 0.15f)); g.fillPath(floor); }
     }
-
-    // Left wall (visible in isometric)
+    // Left wall
     {
         juce::Path leftWall;
         leftWall.startNewSubPath(b0); leftWall.lineTo(b3); leftWall.lineTo(t3); leftWall.lineTo(t0);
         leftWall.closeSubPath();
         g.setColour(juce::Colour(0xff111122).withAlpha(0.5f));
         g.fillPath(leftWall);
+        if (enorm > 0.01f) { g.setColour(glowColour.withAlpha(enorm * 0.25f)); g.fillPath(leftWall); }
     }
-
     // Back wall
     {
         juce::Path backWall;
@@ -124,62 +151,46 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
         backWall.closeSubPath();
         g.setColour(juce::Colour(0xff151528).withAlpha(0.4f));
         g.fillPath(backWall);
+        if (enorm > 0.01f) { g.setColour(glowColour.withAlpha(enorm * 0.20f)); g.fillPath(backWall); }
     }
 
-    // Draw edges
-    g.setColour(edgeColour);
+    // --- Draw curved edges ---
+    g.setColour(edgeGlow);
     float lineThickness = 1.5f;
 
-    // Bottom face edges
-    g.drawLine(b0.x, b0.y, b1.x, b1.y, lineThickness);
-    g.drawLine(b1.x, b1.y, b2.x, b2.y, lineThickness);
-    g.drawLine(b2.x, b2.y, b3.x, b3.y, lineThickness);
-    g.drawLine(b3.x, b3.y, b0.x, b0.y, lineThickness);
+    // Bottom face
+    drawCurvedEdge(b0, b1, cb01, lineThickness);
+    drawCurvedEdge(b1, b2, cb12, lineThickness);
+    drawCurvedEdge(b2, b3, cb23, lineThickness);
+    drawCurvedEdge(b3, b0, cb30, lineThickness);
+    // Top face
+    drawCurvedEdge(t0, t1, ct01, lineThickness);
+    drawCurvedEdge(t1, t2, ct12, lineThickness);
+    drawCurvedEdge(t2, t3, ct23, lineThickness);
+    drawCurvedEdge(t3, t0, ct30, lineThickness);
+    // Vertical edges
+    drawCurvedEdge(b0, t0, cv0, lineThickness);
+    drawCurvedEdge(b1, t1, cv1, lineThickness);
+    drawCurvedEdge(b2, t2, cv2, lineThickness);
+    drawCurvedEdge(b3, t3, cv3, lineThickness);
 
-    // Top face edges
-    g.drawLine(t0.x, t0.y, t1.x, t1.y, lineThickness);
-    g.drawLine(t1.x, t1.y, t2.x, t2.y, lineThickness);
-    g.drawLine(t2.x, t2.y, t3.x, t3.y, lineThickness);
-    g.drawLine(t3.x, t3.y, t0.x, t0.y, lineThickness);
-
-    // Vertical edges (pillars)
-    g.drawLine(b0.x, b0.y, t0.x, t0.y, lineThickness);
-    g.drawLine(b1.x, b1.y, t1.x, t1.y, lineThickness);
-    g.drawLine(b2.x, b2.y, t2.x, t2.y, lineThickness);
-    g.drawLine(b3.x, b3.y, t3.x, t3.y, lineThickness);
-
-    // Apply curvature to visible edges (bow them)
-    if (std::abs(curve) > 5.0f) {
-        float bowAmount = (curve / 100.0f) * maxDim * 0.15f;
-        g.setColour(edgeColour.withAlpha(0.4f));
-
-        // Bow the front-bottom edge
-        auto midB01 = project(0, -hl + bowAmount, 0, scale, cx, cy);
-        juce::Path bowedFront;
-        bowedFront.startNewSubPath(b0);
-        bowedFront.quadraticTo(midB01, b1);
-        g.strokePath(bowedFront, juce::PathStrokeType(1.0f));
-
-        // Bow the left-bottom edge
-        auto midB03 = project(-hw - bowAmount, 0, 0, scale, cx, cy);
-        juce::Path bowedLeft;
-        bowedLeft.startNewSubPath(b0);
-        bowedLeft.quadraticTo(midB03, b3);
-        g.strokePath(bowedLeft, juce::PathStrokeType(1.0f));
-
-        // Bow a vertical edge
-        auto midV0 = project(-hw - bowAmount * 0.5f, -hl, hh * 0.5f, scale, cx, cy);
-        juce::Path bowedVert;
-        bowedVert.startNewSubPath(b0);
-        bowedVert.quadraticTo(midV0, t0);
-        g.strokePath(bowedVert, juce::PathStrokeType(1.0f));
+    // Energy glow halo: draw thicker translucent edges on top
+    if (enorm > 0.05f) {
+        g.setColour(glowColour.withAlpha(enorm * 0.5f));
+        float glowThick = 2.0f + enorm * 4.0f;
+        drawCurvedEdge(b0, b1, cb01, glowThick);
+        drawCurvedEdge(b1, b2, cb12, glowThick);
+        drawCurvedEdge(b3, b0, cb30, glowThick);
+        drawCurvedEdge(t0, t1, ct01, glowThick);
+        drawCurvedEdge(t3, t0, ct30, glowThick);
+        drawCurvedEdge(b0, t0, cv0, glowThick);
+        drawCurvedEdge(b1, t1, cv1, glowThick);
     }
 
     // --- Source dot (orange) ---
     float srcPosX = (sX - 0.5f) * width;
     float srcPosY = (sY - 0.5f) * length;
     float srcPosZ = sZ * height;
-    // Apply skew interpolation for height
     float srcSkew = skewOffset * (srcPosZ / (height + 0.01f));
     auto srcPt = project(srcPosX + srcSkew, srcPosY, srcPosZ, scale, cx, cy);
 
@@ -187,8 +198,6 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
     g.fillEllipse(srcPt.x - 5, srcPt.y - 5, 10, 10);
     g.setColour(juce::Colour(0xffff8833).withAlpha(0.3f));
     g.fillEllipse(srcPt.x - 8, srcPt.y - 8, 16, 16);
-
-    // Source label
     g.setColour(juce::Colour(0xffff8833));
     g.setFont(juce::FontOptions(10.0f));
     g.drawText("SRC", juce::Rectangle<float>(srcPt.x - 12, srcPt.y - 18, 24, 12),
@@ -205,13 +214,11 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
     g.fillEllipse(lisPt.x - 5, lisPt.y - 5, 10, 10);
     g.setColour(juce::Colour(0xff33cc66).withAlpha(0.3f));
     g.fillEllipse(lisPt.x - 8, lisPt.y - 8, 16, 16);
-
-    // Listener label
     g.setColour(juce::Colour(0xff33cc66));
     g.drawText("LIS", juce::Rectangle<float>(lisPt.x - 12, lisPt.y - 18, 24, 12),
                juce::Justification::centred);
 
-    // --- Direct path line (faint) ---
+    // --- Direct path line ---
     g.setColour(juce::Colours::white.withAlpha(0.15f));
     g.drawLine(srcPt.x, srcPt.y, lisPt.x, lisPt.y, 1.0f);
 
@@ -219,21 +226,18 @@ void RoomVisualizationComponent::paint(juce::Graphics& g)
     g.setColour(juce::Colour(0xff667799));
     g.setFont(juce::FontOptions(11.0f));
 
-    // Length (along Y axis)
     auto lStart = project(hw + 0.3f, -hl, 0, scale, cx, cy);
     auto lEnd   = project(hw + 0.3f,  hl, 0, scale, cx, cy);
     auto lMid   = juce::Point<float>((lStart.x + lEnd.x) * 0.5f, (lStart.y + lEnd.y) * 0.5f);
     g.drawText(juce::String(length, 1) + "m", juce::Rectangle<float>(lMid.x - 20, lMid.y - 6, 40, 12),
                juce::Justification::centred);
 
-    // Width (along X axis)
     auto wStart = project(-hw, -hl - 0.3f, 0, scale, cx, cy);
     auto wEnd   = project( hw, -hl - 0.3f, 0, scale, cx, cy);
     auto wMid   = juce::Point<float>((wStart.x + wEnd.x) * 0.5f, (wStart.y + wEnd.y) * 0.5f);
     g.drawText(juce::String(width, 1) + "m", juce::Rectangle<float>(wMid.x - 20, wMid.y - 6, 40, 12),
                juce::Justification::centred);
 
-    // Height (along Z axis)
     auto hBase = project(-hw - 0.3f, -hl, 0, scale, cx, cy);
     auto hTop  = project(-hw - 0.3f + skewOffset, -hl, hh, scale, cx, cy);
     auto hMid  = juce::Point<float>((hBase.x + hTop.x) * 0.5f, (hBase.y + hTop.y) * 0.5f);
@@ -264,17 +268,19 @@ FirstAirEditor::FirstAirEditor(FirstAirProcessor& p)
         if (info.isOutput) continue;  // Skip other bargraphs
 
         // Wire up zone pointers for room visualization
-        if (info.label == "Length")     roomViz.roomLengthZone = info.zone;
-        if (info.label == "Width")      roomViz.roomWidthZone  = info.zone;
-        if (info.label == "Height")     roomViz.roomHeightZone = info.zone;
-        if (info.label == "Skew")       roomViz.roomSkewZone   = info.zone;
-        if (info.label == "Curvature")  roomViz.roomCurveZone  = info.zone;
-        if (info.label == "Source X")   roomViz.srcXZone  = info.zone;
-        if (info.label == "Source Y")   roomViz.srcYZone  = info.zone;
-        if (info.label == "Source Z")   roomViz.srcZZone  = info.zone;
-        if (info.label == "Listener X") roomViz.lisXZone  = info.zone;
-        if (info.label == "Listener Y") roomViz.lisYZone  = info.zone;
-        if (info.label == "Listener Z") roomViz.lisZZone  = info.zone;
+        // Use juceId to avoid ambiguity (e.g. "Width" exists in both Space and Mix groups)
+        if (info.juceId == "space_length")     roomViz.roomLengthZone = info.zone;
+        if (info.juceId == "space_width")      roomViz.roomWidthZone  = info.zone;
+        if (info.juceId == "space_height")     roomViz.roomHeightZone = info.zone;
+        if (info.juceId == "space_skew")       roomViz.roomSkewZone   = info.zone;
+        if (info.juceId == "space_curvature")  roomViz.roomCurveZone  = info.zone;
+        if (info.juceId == "position_source_x")   roomViz.srcXZone  = info.zone;
+        if (info.juceId == "position_source_y")   roomViz.srcYZone  = info.zone;
+        if (info.juceId == "position_source_z")   roomViz.srcZZone  = info.zone;
+        if (info.juceId == "position_listener_x") roomViz.lisXZone  = info.zone;
+        if (info.juceId == "position_listener_y") roomViz.lisYZone  = info.zone;
+        if (info.juceId == "position_listener_z") roomViz.lisZZone  = info.zone;
+        if (info.juceId == "energy_energy")    roomViz.energyZone = info.zone;
 
         // Track pitch-related param IDs for visibility logic
         if (info.label == "Pitch On") {
@@ -577,9 +583,12 @@ void FirstAirEditor::presetChanged()
 void FirstAirEditor::timerCallback()
 {
     // Sync preset selector if host changed program externally
-    int current = processor.getCurrentProgram();
-    if (presetSelector.getSelectedId() != current + 1)
-        presetSelector.setSelectedId(current + 1, juce::dontSendNotification);
+    // Only sync factory presets from host; user presets (id >= 1000) are managed by UI
+    if (presetSelector.getSelectedId() < 1000) {
+        int current = processor.getCurrentProgram();
+        if (presetSelector.getSelectedId() != current + 1)
+            presetSelector.setSelectedId(current + 1, juce::dontSendNotification);
+    }
 
     // Update pitch note display
     if (snappedNoteZone != nullptr) {

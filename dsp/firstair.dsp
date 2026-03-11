@@ -667,21 +667,29 @@ buf_len = (buffer_length_ms / 1000.0 * ma.SR) : max(4800) : min(FREEZE_BUF_MAX -
 buf_xfade_len = (buffer_xfade_ms / 1000.0 * ma.SR) : max(48) : min(buf_len / 2);
 
 // Buffer freeze amount with asymmetric smoothing:
-// Engage = instant (no smoothing). Disengage = smooth crossfade.
+// Engage = 10ms ramp (prevents click). Disengage = 50ms smooth fade.
 bf_raw = buffer_freeze;
-bf = bf_raw : si.smooth(select2(bf_raw > bf_raw', 0.0, ba.tau2pole(0.050)));
+bf = bf_raw : si.smooth(select2(bf_raw > bf_raw', ba.tau2pole(0.010), ba.tau2pole(0.050)));
 
 // Buffer self-feedback amount
 buf_fb = buffer_feedback_amt / 100.0 : min(0.98);  // cap to prevent blowup
 
-// Buffer processor: variable-length self-feeding delay with crossfade.
+// Buffer processor: variable-length self-feeding delay with crossfade at loop point.
 // When bf=0: passthrough (live signal).
 // When bf=1: loop plays back, mixed with feedback of its own output.
-// The crossfade at the loop boundary uses a raised-cosine window to prevent clicks.
-buffer_freeze_processor = _ * (1.0 - bf) : (+ ~ (buf_delay * (bf + buf_fb * (1.0 - bf))))
+// A raised-cosine crossfade window at the loop boundary prevents clicks.
+buffer_freeze_processor = _ * (1.0 - bf) : (+ ~ (buf_delay_xfade * (bf + buf_fb * (1.0 - bf))))
 with {
-    // Fractional delay for variable buffer length
-    buf_delay = de.fdelay(FREEZE_BUF_MAX, buf_len - 1);
+    // Phase ramp: counts 0..buf_len-1 then wraps (synchronized with delay read)
+    buf_phase = +(1) ~ (%(int(buf_len)));
+    // Raised-cosine crossfade window: fades to 0 near the wrap point, prevents discontinuity
+    xf_region = buf_xfade_len;
+    dist_to_wrap = min(buf_phase, buf_len - buf_phase);
+    xfade_gain = min(1.0, dist_to_wrap / max(xf_region, 1.0));
+    xfade_window = 0.5 - 0.5 * cos(xfade_gain * ma.PI);
+    // Apply crossfade only when frozen (bf > 0), otherwise pass through clean
+    env = select2(bf > 0.01, 1.0, xfade_window);
+    buf_delay_xfade = de.fdelay(FREEZE_BUF_MAX, buf_len - 1) * env;
 };
 
 // --- Ducking engine ---
@@ -726,7 +734,7 @@ weather_gen = wind_sound;
 // Implemented as opposing high-shelf and low-shelf: when one boosts, the other cuts.
 // ±50 maps to ±12dB of tilt. Crossovers at 200Hz (low) and 3kHz (high).
 // When tone_enable=0, tone_db=0 → both shelves are 0dB (transparent/bypass).
-tone_db = fb_tone * 0.24 * tone_enable;  // ±50 → ±12dB, zeroed when disabled
+tone_db = fb_tone * 0.12 * tone_enable;  // ±50 → ±6dB per iteration (was ±12, too aggressive)
 tone_eq = fi.highshelf(1, tone_db, 3000)
         : fi.lowshelf(1, 0.0 - tone_db, 200);
 
@@ -795,10 +803,23 @@ shimmer_shift = _ <: (_, shimmer_with_feedback) : select2(shimmer_enable);
 // --- Pitch Glide System ---
 // Convert Hz → MIDI note (semitone space) → apply portamento → snap → convert back to Hz.
 // Glide in semitone space gives musically correct portamento (equal perceived rate).
-// Minimum 5ms smoothing even at Glide=0 (replaces removed si.smoo, prevents clicks).
-glide_time = max(pitch_glide / 1000.0, 0.005);
+//
+// Uses a linear slew limiter for constant-rate glide (more musical than exponential).
+// At Glide=0: instant (5ms smoothing for click prevention).
+// At Glide=2000ms: takes 2 seconds to traverse one octave (12 semitones).
+glide_time = max(pitch_glide / 1000.0, 0.005);  // seconds
+// Slew rate: semitones per sample. 12 semitones / (glide_time * SR) for 1-octave glide time
+glide_rate = 12.0 / (glide_time * ma.SR);
 pitch_midi_raw = 69.0 + 12.0 * log(max(fb_pitch, 20.0) / 440.0) / log(2.0);
-pitch_midi_glided = pitch_midi_raw : si.smooth(ba.tau2pole(glide_time));
+// Linear slew limiter: move toward target at constant rate
+// Uses letrec for explicit single-sample feedback. Output moves toward input
+// by at most glide_rate semitones per sample → constant-speed portamento.
+pitch_midi_glided = pitch_midi_raw : slew_lim
+with {
+    slew_lim(in) = out letrec {
+        'out = out + max(-glide_rate, min(glide_rate, in - out));
+    };
+};
 pitch_midi = select2(pitch_snap, pitch_midi_glided, rint(pitch_midi_glided));
 
 // Snapped MIDI note number for display (editor reads this via bargraph zone pointer)
@@ -999,10 +1020,25 @@ with {
 //   input 2 (R) → slot 2 (dry_R) and slot 4 (reverb input R)
 // Then: slots 1,2 pass through; slots 3,4 sum to mono and feed reverb.
 
+// --- Brickwall Limiter ---
+// Lookahead limiter: prevents clipping from self-oscillation or high energy.
+// 5ms lookahead, 50ms release. Ceiling at -0.5dBFS to prevent inter-sample peaks.
+// Transparent at normal levels, catches only peaks that would clip.
+limiter_ceiling = 0.944;  // -0.5dBFS
+limiter_attack  = 0.005 * ma.SR;  // 5ms lookahead in samples
+limiter_release_pole = ba.tau2pole(0.050);  // 50ms release
+
+// Per-channel peak follower with fast attack / slow release
+peak_env(x) = abs(x) : max ~ (*(limiter_release_pole));
+// Gain reduction: if peak > ceiling, reduce; otherwise 1.0
+limiter_gr(x) = min(1.0, limiter_ceiling / max(peak_env(x), 0.0001));
+// Apply limiter with lookahead delay (delay input, compute GR from undelayed)
+brickwall_limiter(x) = de.delay(512, int(limiter_attack), x) * limiter_gr(x);
+
 process = route(2, 4, (1,1), (2,2), (1,3), (2,4))
         : _, _, (+ : *(0.5) : reverb_mono)
         : drywet_mix
-        : par(i, 2, *(out_gain) : ma.tanh)
+        : par(i, 2, *(out_gain) : brickwall_limiter)
         : par(i, 2, attach(_, rt60_display) : attach(_, dist_display)
             : attach(_, vol_display) : attach(_, sos_display)
             : attach(_, density_display) : attach(_, snapped_note_display)

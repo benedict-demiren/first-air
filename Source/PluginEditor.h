@@ -139,6 +139,7 @@ public:
     float* lisXZone  = nullptr;
     float* lisYZone  = nullptr;
     float* lisZZone  = nullptr;
+    float* energyZone = nullptr;
 
     void paint(juce::Graphics& g) override;
 

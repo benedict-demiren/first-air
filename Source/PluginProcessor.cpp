@@ -165,6 +165,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout FirstAirProcessor::createPar
                 juce::StringArray{"Mix", "Duck Reject", "Wet Post-Duck"},
                 static_cast<int>(p.init)
             ));
+        } else if (displayName == "Buffer Source") {
+            layout.add(std::make_unique<juce::AudioParameterChoice>(
+                juce::ParameterID{id, 1},
+                displayName,
+                juce::StringArray{"Post-FDN", "Pre-FDN", "Post-Duck"},
+                static_cast<int>(p.init)
+            ));
+        } else if (displayName == "Shimmer Curve") {
+            layout.add(std::make_unique<juce::AudioParameterChoice>(
+                juce::ParameterID{id, 1},
+                displayName,
+                juce::StringArray{"Linear", "Log", "Exp"},
+                static_cast<int>(p.init)
+            ));
         } else if (p.isToggle) {
             layout.add(std::make_unique<juce::AudioParameterBool>(
                 juce::ParameterID{id, 1},
@@ -239,6 +253,12 @@ FirstAirProcessor::FirstAirProcessor()
             info.isChoice = true;
             info.numChoices = 13;
         } else if (shortLabel == "Output Mode") {
+            info.isChoice = true;
+            info.numChoices = 3;
+        } else if (shortLabel == "Buffer Source") {
+            info.isChoice = true;
+            info.numChoices = 3;
+        } else if (shortLabel == "Shimmer Curve") {
             info.isChoice = true;
             info.numChoices = 3;
         }
