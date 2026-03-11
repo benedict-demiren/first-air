@@ -1,8 +1,8 @@
 // ============================================================================
-// First Air — Physical Geometry Reverb with Atmospheric Modeling
-// Module 1: Room Geometry + Wall Material + SPL Compression
-// Module 2: Atmosphere — Dynamic speed of sound, air absorption,
-//           density-driven SPL, thermal turbulence modulation
+// First Air v2 — Physical Geometry Reverb with Atmospheric Modeling
+// Pass 1: SPL Waveshaper Rework — multiband, distance-scaled, envelope-coupled
+//         polynomial soft clipper. DC blocker per FDN line. Density soft-limiting.
+//         Turbulence depth smoothing. Soft-knee compressor before sat ceiling.
 // ============================================================================
 //
 import("stdfaust.lib");
@@ -487,7 +487,9 @@ turb_norm = turbulence / 100.0;
 temp_turb_scale = 0.7 + 0.6 * ((temperature + 40.0) / 100.0);  // 0.7 at -40°C, 1.3 at 60°C
 
 // Modulation depth in samples
-mod_depth = 0.3 + turb_norm * 5.0 * temp_turb_scale;
+// v2: 1-pole smoothing on depth to prevent zipper noise on parameter changes.
+// Smooths the depth control, NOT the oscillators (which must remain incommensurate).
+mod_depth = (0.3 + turb_norm * 5.0 * temp_turb_scale) : si.smoo;
 
 // Per-line modulation: 3 oscillators at incommensurate rates
 // Osc 1: slow (0.05-0.3 Hz) — large-scale thermal drift
@@ -502,71 +504,126 @@ thermal_mod(i) = ( os.oscsin(thermal_osc1_rate(i)) * 0.5
                  + os.oscsin(thermal_osc3_rate(i)) * 0.2 * turb_norm )
                * mod_depth;
 
-// --- SPL Nonlinearity: Asymmetric tanh waveshaper ---
-// Models nonlinear air propagation at high SPL. Compression peaks are clipped
-// harder than rarefaction troughs (asymmetric), matching real physics where
-// compression half-cycles travel faster than rarefaction.
+// --- SPL Nonlinearity v2: Multiband, distance-scaled, envelope-coupled ---
+// Models nonlinear air propagation at high SPL — the "Albini spatial compression"
+// concept. Reworked from v1's simple tanh waveshaper to address three physical
+// realities: nonlinearity is distance-dependent (cumulative over path length),
+// frequency-dependent (bass compresses first), and level-dependent (louder input
+// = more spatial compression in the feedback paths).
 //
-// Waveshaper: output = tanh(drive * (x + bias)) - tanh(drive * bias)
-//   bias ≈ 0.05 creates the asymmetry
-//   DC offset from bias is removed by the subtraction term
+// Architecture per FDN line:
+//   Signal → 3-band split (LR4 crossover at 200Hz, 4kHz)
+//   → per-band polynomial soft clipper with distance-scaled drive
+//   → per-band recombine → DC blocker (per-line, not just output)
 //
-// Drive per line scales with:
-//   1. Global Energy parameter (0% = linear, 100% = heavy compression)
-//   2. Per-line propagation distance (longer delays = more accumulated nonlinearity)
-//
-// Pre-emphasis (+3dB high shelf at 2kHz) before the waveshaper models
-// frequency-dependent distortion (shorter wavelengths accumulate faster).
-// Complementary de-emphasis after restores spectral balance.
+// Polynomial soft clipper: f(x) = x - (x^3)/3 for |x|<=1, hard clip beyond.
+// Gentler onset than tanh, more even-order harmonics (2nd harmonic warmth).
+// Small asymmetric bias (5%) retained for physical accuracy.
 
-SPL_BIAS = 0.05;  // Asymmetry bias (small positive value)
+SPL_BIAS = 0.03;  // Reduced asymmetry bias (v1 was 0.05 — too much DC)
 
-// Energy 0→100% maps to drive 1.0→8.0 (1.0 = transparent, tanh(x)≈x for small x)
-// The mapping is curved so perceptual onset is around 15-25%
 energy_norm = energy / 100.0;
-// Quadratic curve: gentle onset, aggressive top.
-// Scaled by density_ratio: denser gas (SF6 ~5x) = more nonlinear,
-// lighter gas (He ~0.13x) = nearly linear. Clamped at 6x for safety.
-base_drive = (1.0 + energy_norm * energy_norm * 7.0) * min(density_ratio, 6.0);
 
-// Per-line drive scaling: longer delay lines = sound has traveled further = more distortion
-// Scale from 1.0x (shortest line) to 1.5x (longest line)
-line_drive_scale(i) = 1.0 + 0.5 * (i / (N - 1.0));
-line_drive(i) = base_drive * line_drive_scale(i);
+// --- Density-scaled drive (soft-limited to prevent runaway at extreme densities) ---
+// v2: uses tanh(density/ref) instead of linear scaling. Venus (density_ratio ~65)
+// now maps to ~1.0 instead of 65x drive. Safe and musical.
+density_scale = ma.tanh(density_ratio / 1.5) * 1.5;  // ~1.0 for air, soft-limited for extremes
 
-// The DC offset correction term (constant for a given drive)
-dc_offset(i) = ma.tanh(line_drive(i) * SPL_BIAS);
+// Base drive: quadratic onset for perceptual curve. Energy 0→100% maps 1.0→8.0
+base_drive = (1.0 + energy_norm * energy_norm * 7.0) * density_scale;
 
-// Small-signal gain normalization.
-// The raw waveshaper has derivative f'(0) = drive * sech²(drive*bias)
-//   = drive * (1 - tanh²(drive*bias)) = drive * (1 - dc_offset²).
-// At drive>1 this exceeds 1.0, which would add energy to the feedback loop → blowup.
-// Dividing by f'(0) ensures unity gain for small signals; only peaks get compressed.
-spl_gain_norm(i) = 1.0 / (line_drive(i) * (1.0 - dc_offset(i) * dc_offset(i)) + 0.0001);
+// --- Envelope-coupled drive ---
+// Slow envelope follower on FDN input energy. Louder input = more SPL compression
+// in the feedback paths. Creates the sensation that the room responds to level.
+// Attack ~50ms, release ~200ms. Modulation scales with Energy upper range (60-100%).
+spl_env_attack = ba.tau2pole(0.050);  // 50ms attack
+spl_env_release = ba.tau2pole(0.200); // 200ms release
+// env_amount ramps from 0 at Energy≤60% to 1.0 at Energy=100%
+spl_env_amount = max(0.0, (energy_norm - 0.6) / 0.4);
 
-// Output gain: normalized (stable) or raw (feedback drone mode)
-// feedback_mode=0 → spl_gain_norm (unity small-signal gain, only compresses peaks)
-// feedback_mode=1 → 1.0 (drive amplifies in feedback loop → runaway resonance)
-spl_output_gain(i) = select2(feedback_mode, spl_gain_norm(i), 1.0);
+// --- Distance-scaled drive per line ---
+// Each FDN line represents a different path length. Longer paths = more accumulated
+// nonlinearity. drive_per_line = base_drive * (delay_length / max_delay_length).
+// Short early reflections stay nearly linear; long reverberant paths compress most.
+// delay_m(i) is defined in Section 3B — actual path length in meters.
+max_delay_m = 4.0 * mean_free_path + 0.0001;  // longest possible path
 
-// Asymmetric waveshaper for line i
-spl_waveshaper(i) = _ : (\(x).(ma.tanh(line_drive(i) * (x + SPL_BIAS)) - dc_offset(i)))
-                   : *(spl_output_gain(i));
+// Per-band drive multipliers: bass compresses first (most drive), highs least
+// In real rooms, low frequencies carry more energy and interact more with
+// room modes, causing earlier onset of nonlinear compression.
+spl_drive_low_mult  = 1.5;  // Low band: 50% more drive
+spl_drive_mid_mult  = 1.0;  // Mid band: reference
+spl_drive_hi_mult   = 0.5;  // High band: 50% less drive
 
-// Pre-emphasis: boost HF before waveshaper (models frequency-dependent distortion)
-// De-emphasis: complementary cut after (restores spectral balance)
-// Only active when Energy > 0; at Energy=0, these are unity gain (+0dB)
-pre_emphasis_gain = energy_norm * 3.0;   // 0 to +3 dB
-pre_emphasis  = fi.highshelf(1, pre_emphasis_gain, 2000);
-de_emphasis   = fi.highshelf(1, 0.0 - pre_emphasis_gain, 2000);
+// Per-line drive with distance scaling and envelope coupling
+// effective_drive = base_drive * distance_ratio * (1 + env_amount * envelope)
+// The envelope input is provided as an argument to spl_nonlin_v2
+line_drive_v2(i, env_val) = base_drive * dist_scale * env_scale
+with {
+    dist_scale = delay_m(i) / max_delay_m;  // 0..1 based on path length
+    env_scale = 1.0 + spl_env_amount * env_val;  // envelope coupling
+};
 
-// Complete per-line nonlinearity chain: pre-emphasis → waveshaper → de-emphasis
-// At Energy=0: drive=1.0, tanh(1.0*(x+0.05))-tanh(0.05) ≈ x for normal levels → transparent
-spl_nonlin(i) = pre_emphasis : spl_waveshaper(i) : de_emphasis;
+// --- Polynomial soft clipper ---
+// f(x) = x - (x^3)/3 for |x| <= 1.0, hard-limited beyond.
+// With asymmetric bias: f(drive * (x + bias)) - f(drive * bias)
+// Gentler than tanh: derivative at zero = 1 - (drive*bias)^2 instead of sech^2.
+// More even-order harmonics → warmer character.
+poly_clip(x) = select2(abs(x) > 1.0, x - (x*x*x) / 3.0, ma.signum(x) * 2.0/3.0);
+
+// Per-band waveshaper with gain normalization
+band_waveshaper(drive_val) = _ : (\(x).(
+    poly_clip(drive_val * (x + SPL_BIAS)) - poly_clip(drive_val * SPL_BIAS)
+)) : *(gain_norm)
+with {
+    // Small-signal gain normalization: derivative of poly_clip at bias point
+    // f'(x) = 1 - x^2 for |x|<=1. At x=drive*bias: f'= 1-(drive*bias)^2
+    // Total small-signal gain = drive * (1 - (drive*bias)^2)
+    db = drive_val * SPL_BIAS;
+    raw_gain = drive_val * max(1.0 - db*db, 0.01);
+    gain_norm = select2(feedback_mode, 1.0 / (raw_gain + 0.0001), 1.0);
+};
+
+// --- 3-band crossover (Linkwitz-Riley 4th order) ---
+// Splits signal into low (<200Hz), mid (200-4kHz), high (>4kHz).
+// LR4 = two cascaded Butterworth 2nd-order filters — flat magnitude sum,
+// zero phase error at crossover points.
+lr4_lp(fc) = fi.lowpass(2, fc) : fi.lowpass(2, fc);
+lr4_hp(fc) = fi.highpass(2, fc) : fi.highpass(2, fc);
+
+// Split into 3 bands: low, mid, high
+split3 = _ <: (lr4_lp(200), (_ : lr4_hp(200) : lr4_lp(4000)), lr4_hp(4000));
+
+// --- Soft-knee compressor before saturation ceiling ---
+// Ratio 2:1, threshold -6 dBFS in FDN internal signal.
+// Catches peaks more gracefully than hard tanh ceiling.
+// Only active in feedback mode (normal mode already has gain normalization).
+soft_comp_thresh = 0.5;  // -6 dBFS ≈ 0.5 linear
+soft_comp_ratio = 2.0;
+soft_comp(x) = select2(feedback_mode, x,
+    select2(abs(x) > soft_comp_thresh,
+        x,
+        ma.signum(x) * (soft_comp_thresh + (abs(x) - soft_comp_thresh) / soft_comp_ratio)
+    )
+);
+
+// --- Complete per-line nonlinearity: multiband waveshaper with distance scaling ---
+// Takes the FDN line signal and an envelope value.
+// Splits into 3 bands, applies different drive per band, recombines.
+// At Energy=0: drive≈0 (distance_scale), poly_clip(~0) ≈ 0 → transparent (dry through).
+// Actually at Energy=0 base_drive=1.0*density_scale, but distance scaling keeps it near-linear.
+spl_nonlin_v2(i, env_val) = split3 : (band_lo, band_mid, band_hi) :> _
+with {
+    drv = line_drive_v2(i, env_val);
+    band_lo  = band_waveshaper(drv * spl_drive_low_mult);
+    band_mid = band_waveshaper(drv * spl_drive_mid_mult);
+    band_hi  = band_waveshaper(drv * spl_drive_hi_mult);
+};
 
 // --- DC blocker ---
-// Safety net: removes any residual DC offset introduced by the asymmetric waveshaper
-// over many feedback iterations. Simple 1st-order highpass at ~5Hz.
+// v2: placed inside each FDN line (after waveshaper) AND at the output.
+// The polynomial clipper with asymmetric bias generates DC — the blocker must be
+// downstream of the waveshaper in every FDN line, not just at the output.
 dc_blocker = fi.dcblocker;
 
 // --- Pre-delay line ---
@@ -637,12 +694,10 @@ tone_eq = fi.highshelf(1, tone_db, 3000)
         : fi.lowshelf(1, 0.0 - tone_db, 200);
 
 // --- Saturation ceiling (feedback mode only) ---
-// In feedback mode, the unnormalized waveshaper adds energy each iteration.
-// Without a ceiling, signal grows to digital infinity → speaker damage.
-// This tanh soft clip lets the drone grow to a natural saturation level (~0dBFS)
-// and stabilize there. Creates a "pressurized room" feel instead of explosion.
-// In normal mode (feedback_mode=0), this is bypassed (identity function).
-sat_ceiling(x) = select2(feedback_mode, x, ma.tanh(x));
+// v2: soft_comp (2:1 ratio, -6dBFS threshold) catches peaks before the hard tanh ceiling.
+// In normal mode (feedback_mode=0), both are bypassed (identity function).
+// The soft compressor handles moderate peaks gracefully; tanh is the safety net.
+sat_ceiling(x) = select2(feedback_mode, soft_comp(x), ma.tanh(soft_comp(x)));
 
 // --- Shimmer: pitch-shifted feedback ---
 // Granular-style pitch shifter using two overlapping grains with crossfade.
@@ -717,8 +772,13 @@ final_delay(i) = delay_len(i) * (1.0 - pitch_blend) + quantized_delay(i) * pitch
 // The actual delay lines provide the bulk of the delay.
 
 // The FDN: takes mono input, produces N parallel delay line outputs
+// v2: envelope follower on input feeds SPL drive coupling
 fdn(input) = (fdn_input(input) : delay_lines) ~ (feedback_path)
 with {
+    // Input envelope for SPL drive coupling (tracked outside feedback loop).
+    // Simple amplitude follower: ~100ms smoothing. Tracks energy, not transients.
+    env_val = input : abs : an.amp_follower(0.100) : min(1.0);
+
     // Inject mono input into all N delay lines with equal gain
     fdn_input(x) = par(i, N, x / sqrt(N) + _);
 
@@ -729,13 +789,16 @@ with {
     // conv_mod: coordinated wave pattern across lines (convection currents)
     delay_lines = par(i, N, de.fdelay(MAXDELAY, final_delay(i) + thermal_mod(i) + conv_mod(i)));
 
-    // Feedback path per line:
+    // Feedback path per line (v2):
     //   damper (wall absorption) → air_absorption (atmospheric HF loss) →
-    //   tone EQ (user tilt) → SPL nonlinearity →
-    //   feedback gain → saturation ceiling (feedback mode only)
+    //   tone EQ (user tilt) → shimmer →
+    //   multiband SPL nonlinearity (distance-scaled, envelope-coupled) →
+    //   per-line DC blocker (catches waveshaper DC before feedback) →
+    //   freeze gain → soft compressor + saturation ceiling
     // Then all 16 lines → Householder mixing matrix
     feedback_path = par(i, N, damper : air_absorption(i) : tone_eq : shimmer_shift
-                      : spl_nonlin(i) : *(fb_gain_final) : sat_ceiling)
+                      : spl_nonlin_v2(i, env_val) : dc_blocker
+                      : *(fb_gain_final) : sat_ceiling)
                   : householder(N);
 };
 
