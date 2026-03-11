@@ -113,12 +113,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout FirstAirProcessor::createPar
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    // Create a temporary DSP to discover parameters
-    FirstAirDSP tempDSP;
-    tempDSP.init(48000);  // Sample rate doesn't matter for UI discovery
+    // Create a temporary DSP to discover parameters (heap-allocated — the Faust
+    // class contains large delay buffers that would overflow the thread stack)
+    auto tempDSP = std::make_unique<FirstAirDSP>();
+    tempDSP->init(48000);  // Sample rate doesn't matter for UI discovery
 
     FaustParamCollector collector;
-    tempDSP.buildUserInterface(&collector);
+    tempDSP->buildUserInterface(&collector);
 
     for (auto& p : collector.params) {
         if (p.isOutput) continue;  // Skip bargraphs (read-only displays)
