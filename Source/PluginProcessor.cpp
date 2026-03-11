@@ -179,6 +179,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout FirstAirProcessor::createPar
                 juce::StringArray{"Linear", "Log", "Exp"},
                 static_cast<int>(p.init)
             ));
+        } else if (displayName == "Freeze Mode") {
+            layout.add(std::make_unique<juce::AudioParameterChoice>(
+                juce::ParameterID{id, 1},
+                displayName,
+                juce::StringArray{"Through", "Sustain", "Isolate", "Capture", "Crystallise", "Layer"},
+                static_cast<int>(p.init)
+            ));
         } else if (p.isToggle) {
             layout.add(std::make_unique<juce::AudioParameterBool>(
                 juce::ParameterID{id, 1},
@@ -261,6 +268,9 @@ FirstAirProcessor::FirstAirProcessor()
         } else if (shortLabel == "Shimmer Curve") {
             info.isChoice = true;
             info.numChoices = 3;
+        } else if (shortLabel == "Freeze Mode") {
+            info.isChoice = true;
+            info.numChoices = 6;
         }
 
         paramInfos.push_back(info);
@@ -440,6 +450,7 @@ struct FactoryPreset {
 //   5=Metal, 6=Brick, 7=Tile, 8=Fabric, 9=Foam, 10=Marble
 // Gas choices: 0=Air, 1=Helium, 2=CO2, 3=SF6, 4=Methane, 5=Hydrogen,
 //   6=Mars, 7=Venus, 8=Saturn, 9=Titan, 10=Early Earth, 11=Photosphere, 12=Submarine
+// Freeze modes: 0=Through, 1=Sustain, 2=Isolate, 3=Capture, 4=Crystallise, 5=Layer
 static const std::vector<FactoryPreset> factoryPresets = {
     {"Default Room", {
         {"space_length", 8.0f}, {"space_width", 5.0f}, {"space_height", 3.5f},
@@ -451,7 +462,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 0.0f}, {"energy_tone", 0.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.3f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.5f},
@@ -474,7 +485,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -8.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.3f}, {"position_source_y", 0.2f}, {"position_source_z", 0.4f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.35f},
@@ -497,7 +508,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 5.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.4f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.6f}, {"position_listener_z", 0.5f},
@@ -520,7 +531,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 15.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.5f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.5f}, {"position_listener_z", 0.5f},
@@ -543,7 +554,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -15.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.4f}, {"position_source_y", 0.25f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.65f}, {"position_listener_z", 0.4f},
@@ -566,7 +577,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -20.0f},
         {"energy_pitch_on", 1.0f}, {"energy_midi", 1.0f},
         {"energy_pitch", 110.0f}, {"energy_glide", 200.0f}, {"energy_snap", 1.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 1.0f},  // Sustain
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.5f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.5f}, {"position_listener_z", 0.5f},
@@ -589,7 +600,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 20.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.3f}, {"position_source_y", 0.3f}, {"position_source_z", 0.4f},
         {"position_listener_x", 0.6f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.4f},
@@ -612,7 +623,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 0.0f}, {"energy_tone", 0.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.4f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.6f}, {"position_listener_z", 0.5f},
@@ -638,7 +649,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -10.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 10.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 1.0f},  // Sustain
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.3f}, {"position_source_y", 0.2f}, {"position_source_z", 0.4f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.4f},
@@ -661,7 +672,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -20.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.5f}, {"position_source_z", 0.3f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.5f}, {"position_listener_z", 0.5f},
@@ -684,7 +695,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", -25.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 30.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 1.0f},  // Sustain
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.4f}, {"position_source_y", 0.3f}, {"position_source_z", 0.6f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.6f}, {"position_listener_z", 0.4f},
@@ -707,7 +718,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 30.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 60.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 1.0f},
+        {"energy_freeze_mode", 3.0f},  // Capture
         {"energy_shimmer_on", 1.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.3f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.5f},
@@ -730,7 +741,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 10.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 100.0f}, {"energy_input_freeze", 1.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 2.0f},  // Isolate
         {"energy_shimmer_on", 1.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.3f}, {"position_source_y", 0.2f}, {"position_source_z", 0.4f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.7f}, {"position_listener_z", 0.35f},
@@ -753,7 +764,7 @@ static const std::vector<FactoryPreset> factoryPresets = {
         {"energy_tone_on", 1.0f}, {"energy_tone", 25.0f},
         {"energy_pitch_on", 0.0f}, {"energy_midi", 0.0f},
         {"energy_pitch", 20.0f}, {"energy_glide", 0.0f}, {"energy_snap", 0.0f},
-        {"energy_freeze", 0.0f}, {"energy_input_freeze", 0.0f}, {"energy_buffer_freeze", 0.0f},
+        {"energy_freeze_mode", 0.0f},
         {"energy_shimmer_on", 0.0f}, {"energy_shimmer", 12.0f},
         {"position_source_x", 0.5f}, {"position_source_y", 0.5f}, {"position_source_z", 0.5f},
         {"position_listener_x", 0.5f}, {"position_listener_y", 0.5f}, {"position_listener_z", 0.5f},

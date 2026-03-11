@@ -4,6 +4,9 @@
 //         polynomial soft clipper. DC blocker per FDN line. Density soft-limiting.
 // Pass 2: Shimmer & Buffer Expansion — dedicated shimmer feedback loop, curve,
 //         detune. Variable buffer length (100ms-8s), source select, feedback.
+// Pass 3: Freeze Routing — 6-mode freeze matrix (Through/Sustain/Isolate/
+//         Capture/Crystallise/Layer) replacing 3 independent freeze controls.
+//         50ms crossfade between modes, asymmetric buffer engage/disengage.
 // ============================================================================
 //
 import("stdfaust.lib");
@@ -61,9 +64,10 @@ midi_enable = checkbox("[2]Energy/[5]MIDI [tooltip:Enable MIDI pitch input. When
 fb_pitch = hslider("[2]Energy/[6]Pitch [unit:Hz] [tooltip:Tune feedback resonance to a frequency]", 20, 20, 2000, 0.1);
 pitch_glide = hslider("[2]Energy/[7]Glide [unit:ms] [tooltip:Portamento time between pitch changes. 0=instant, 2000=slow slide]", 0, 0, 2000, 1) : si.smoo;
 pitch_snap = checkbox("[2]Energy/[8]Snap [tooltip:Quantize pitch to nearest 12-TET semitone]");
-freeze = hslider("[2]Energy/[9]Freeze [unit:%] [tooltip:Progressive sustain. 0=normal decay, 100=infinite frozen reverb]", 0, 0, 100, 0.1) : si.smoo;
-input_freeze = checkbox("[2]Energy/[10]Input Freeze [tooltip:Mute new audio entering the reverb. Tail sustains, no new input]");
-buffer_freeze = checkbox("[2]Energy/[11]Buffer Freeze [tooltip:Capture and loop the reverb output. Creates infinite sustaining textures]");
+// Freeze Routing Matrix — 6 named modes replacing independent freeze controls.
+// Each mode sets a combination of progressive freeze, input gate, and buffer freeze.
+// Transitions crossfade smoothly (50ms default, asymmetric buffer engage/disengage).
+freeze_mode = nentry("[2]Energy/[9]Freeze Mode [style:menu{'Through':0;'Sustain':1;'Isolate':2;'Capture':3;'Crystallise':4;'Layer':5}] [tooltip:Freeze routing. Through=normal, Sustain=infinite tail, Isolate=freeze+mute input, Capture=buffer loop, Crystallise=full freeze, Layer=mute input+buffer]", 0, 0, 5, 1);
 buffer_length_ms = hslider("[2]Energy/[17]Buffer Length [unit:ms] [tooltip:Freeze buffer length. Short=granular, long=phrase capture]", 2000, 100, 8000, 1) : si.smoo;
 buffer_source = nentry("[2]Energy/[18]Buffer Source [style:menu{'Post-FDN':0;'Pre-FDN':1;'Post-Duck':2}] [tooltip:What signal the buffer captures. Post-FDN=reverb tail, Pre-FDN=dry room entry, Post-Duck=shaped output]", 0, 0, 2, 1);
 buffer_feedback_amt = hslider("[2]Energy/[19]Buffer FB [unit:%] [tooltip:Buffer self-feedback. 0=clean loop, 100=saturating drone]", 0, 0, 100, 0.1) : si.smoo;
@@ -408,11 +412,27 @@ abs_coeff = 0.02 * humidity_factor * temp_factor * gas_abs_factor * pressure_rat
 // mean_delay is computed in Section 3B from room geometry.
 fb_gain = 10.0 ^ (-3.0 * mean_delay / (max(0.1, rt60) * ma.SR)) : min(0.999);
 
-// --- Progressive Freeze ---
+// --- Freeze Routing: derive control signals from mode selector ---
+// Mode:           Progressive  InputGate  Buffer
+// Through  (0):   0            0          0       Normal reverb operation
+// Sustain  (1):   1            0          0       Classic infinite sustain
+// Isolate  (2):   1            1          0       Freeze the tail, stop new input
+// Capture  (3):   0            0          1       Buffer loops current reverb output
+// Crystallise(4): 1            1          1       Triple-locked sustain
+// Layer    (5):   0            1          1       Input muted, buffer captures decaying tail
+fm = int(freeze_mode);
+prog_target = (0.0, 1.0, 1.0, 0.0, 1.0, 0.0) : ba.selectn(6, fm);
+ig_target   = (0.0, 0.0, 1.0, 0.0, 1.0, 1.0) : ba.selectn(6, fm);
+bf_target   = (0.0, 0.0, 0.0, 1.0, 1.0, 1.0) : ba.selectn(6, fm);
+
+// Progressive freeze: 50ms engage, 200ms disengage (Isolate→Through transition feels natural)
+prog_pole = select2(prog_target > 0.5, ba.tau2pole(0.200), ba.tau2pole(0.050));
+freeze_norm = prog_target : si.smooth(prog_pole);
+
+// --- Progressive Freeze gain ---
 // Crossfade feedback gain from normal RT60-derived value toward 0.999 (near-infinite sustain).
-// freeze=0%: fb_gain_final = fb_gain (normal decay)
-// freeze=100%: fb_gain_final = 0.999 (frozen — signal recirculates almost losslessly)
-freeze_norm = freeze / 100.0;
+// freeze_norm=0: fb_gain_final = fb_gain (normal decay)
+// freeze_norm=1: fb_gain_final = 0.999 (frozen — signal recirculates almost losslessly)
 fb_gain_final = fb_gain * (1.0 - freeze_norm) + 0.999 * freeze_norm;
 
 // --- Householder feedback matrix ---
@@ -641,10 +661,10 @@ MAXDELAY_PREDELAY = 24000;  // 500ms at 48kHz
 predelay_samples = predelay_ms / 1000.0 * ma.SR;
 predelay_line = de.fdelay(MAXDELAY_PREDELAY, predelay_samples);
 
-// --- Input Freeze ---
-// When enabled, smoothly mutes new audio entering the reverb.
-// Existing tail sustains (especially with Freeze > 0%), no new excitation.
-input_freeze_smooth = input_freeze : si.smoo;
+// --- Input Gate (from freeze routing) ---
+// When active (Isolate/Crystallise/Layer modes), smoothly mutes new audio.
+// Existing tail sustains, no new excitation. 50ms crossfade.
+input_freeze_smooth = ig_target : si.smooth(ba.tau2pole(0.050));
 input_gate = 1.0 - input_freeze_smooth;
 
 // --- Buffer Freeze v2: variable length, source select, feedback, crossfade ---
@@ -666,10 +686,9 @@ buf_len = (buffer_length_ms / 1000.0 * ma.SR) : max(4800) : min(FREEZE_BUF_MAX -
 // Crossfade length in samples
 buf_xfade_len = (buffer_xfade_ms / 1000.0 * ma.SR) : max(48) : min(buf_len / 2);
 
-// Buffer freeze amount with asymmetric smoothing:
-// Engage = 10ms ramp (prevents click). Disengage = 50ms smooth fade.
-bf_raw = buffer_freeze;
-bf = bf_raw : si.smooth(select2(bf_raw > bf_raw', ba.tau2pole(0.010), ba.tau2pole(0.050)));
+// Buffer freeze amount (from freeze routing) with asymmetric smoothing:
+// Engage = 10ms (instant capture feel). Disengage = 50ms smooth fade.
+bf = bf_target : si.smooth(select2(bf_target > bf_target', ba.tau2pole(0.010), ba.tau2pole(0.050)));
 
 // Buffer self-feedback amount
 buf_fb = buffer_feedback_amt / 100.0 : min(0.98);  // cap to prevent blowup
