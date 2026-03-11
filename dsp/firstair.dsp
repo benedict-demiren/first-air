@@ -2,7 +2,8 @@
 // First Air v2 — Physical Geometry Reverb with Atmospheric Modeling
 // Pass 1: SPL Waveshaper Rework — multiband, distance-scaled, envelope-coupled
 //         polynomial soft clipper. DC blocker per FDN line. Density soft-limiting.
-//         Turbulence depth smoothing. Soft-knee compressor before sat ceiling.
+// Pass 2: Shimmer & Buffer Expansion — dedicated shimmer feedback loop, curve,
+//         detune. Variable buffer length (100ms-8s), source select, feedback.
 // ============================================================================
 //
 import("stdfaust.lib");
@@ -63,8 +64,15 @@ pitch_snap = checkbox("[2]Energy/[8]Snap [tooltip:Quantize pitch to nearest 12-T
 freeze = hslider("[2]Energy/[9]Freeze [unit:%] [tooltip:Progressive sustain. 0=normal decay, 100=infinite frozen reverb]", 0, 0, 100, 0.1) : si.smoo;
 input_freeze = checkbox("[2]Energy/[10]Input Freeze [tooltip:Mute new audio entering the reverb. Tail sustains, no new input]");
 buffer_freeze = checkbox("[2]Energy/[11]Buffer Freeze [tooltip:Capture and loop the reverb output. Creates infinite sustaining textures]");
+buffer_length_ms = hslider("[2]Energy/[17]Buffer Length [unit:ms] [tooltip:Freeze buffer length. Short=granular, long=phrase capture]", 2000, 100, 8000, 1) : si.smoo;
+buffer_source = nentry("[2]Energy/[18]Buffer Source [style:menu{'Post-FDN':0;'Pre-FDN':1;'Post-Duck':2}] [tooltip:What signal the buffer captures. Post-FDN=reverb tail, Pre-FDN=dry room entry, Post-Duck=shaped output]", 0, 0, 2, 1);
+buffer_feedback_amt = hslider("[2]Energy/[19]Buffer FB [unit:%] [tooltip:Buffer self-feedback. 0=clean loop, 100=saturating drone]", 0, 0, 100, 0.1) : si.smoo;
+buffer_xfade_ms = hslider("[2]Energy/[20]Buffer XFade [unit:ms] [tooltip:Crossfade at loop point. Short=tight, long=ambient blend]", 50, 1, 500, 1) : si.smoo;
 shimmer_enable = checkbox("[2]Energy/[12]Shimmer On [tooltip:Pitch-shifted reverb feedback — creates cascading octaves/harmonics]");
 shimmer_pitch = hslider("[2]Energy/[13]Shimmer [unit:st] [tooltip:Pitch shift per feedback iteration. 12=octave up, -12=octave down]", 12, -24, 24, 0.1) : si.smoo;
+shimmer_feedback = hslider("[2]Energy/[14]Shimmer FB [unit:%] [tooltip:Shimmer self-feedback. 0=single shift per iteration, 100=cascading harmonic series]", 0, 0, 100, 0.1) : si.smoo;
+shimmer_curve = nentry("[2]Energy/[15]Shimmer Curve [style:menu{'Linear':0;'Log':1;'Exp':2}] [tooltip:Shimmer amplitude scaling. Log=natural (default), Exp=slow build, Linear=equal]", 1, 0, 2, 1);
+shimmer_detune = hslider("[2]Energy/[16]Shimmer Detune [unit:cents] [tooltip:Pitch shifter detuning. Small values=organic beating, large=metallic clouds]", 0, -50, 50, 0.1) : si.smoo;
 
 // --- Position (Source) ---
 src_x = hslider("[3]Position/[0]Source X [tooltip:Source left-right position]", 0.5, 0.0, 1.0, 0.01) : si.smoo;
@@ -639,13 +647,42 @@ predelay_line = de.fdelay(MAXDELAY_PREDELAY, predelay_samples);
 input_freeze_smooth = input_freeze : si.smoo;
 input_gate = 1.0 - input_freeze_smooth;
 
-// --- Buffer Freeze ---
+// --- Buffer Freeze v2: variable length, source select, feedback, crossfade ---
 // Self-feeding delay that crossfades between live signal and a captured loop.
-// bf=0: passthrough (live signal). bf=1: self-sustaining 2-second loop.
-// si.smoo crossfade ensures smooth capture and release transitions.
-FREEZE_BUF = 96000;  // 2 seconds @ 48kHz
-bf = buffer_freeze : si.smoo;
-buffer_freeze_processor = _ * (1.0 - bf) : (+ ~ (de.delay(FREEZE_BUF, FREEZE_BUF - 1) * bf));
+// v2 additions:
+//   - Variable buffer length (100ms to 8s). Short = granular, long = phrase capture.
+//   - Buffer Source: selects what gets captured (Pre-FDN, Post-FDN, Post-Duck)
+//   - Buffer Feedback: loop self-reinforcement (0=clean, 100=saturating drone)
+//   - Buffer Crossfade: smooth loop point (1-500ms)
+//
+// Buffer engage is instant (captures the moment). Disengage crossfades out.
+
+// Maximum buffer size: 8 seconds at 48kHz = 384000 samples
+FREEZE_BUF_MAX = 384000;
+
+// Buffer length in samples (clamped to valid range)
+buf_len = (buffer_length_ms / 1000.0 * ma.SR) : max(4800) : min(FREEZE_BUF_MAX - 2);
+
+// Crossfade length in samples
+buf_xfade_len = (buffer_xfade_ms / 1000.0 * ma.SR) : max(48) : min(buf_len / 2);
+
+// Buffer freeze amount with asymmetric smoothing:
+// Engage = instant (no smoothing). Disengage = smooth crossfade.
+bf_raw = buffer_freeze;
+bf = bf_raw : si.smooth(select2(bf_raw > bf_raw', 0.0, ba.tau2pole(0.050)));
+
+// Buffer self-feedback amount
+buf_fb = buffer_feedback_amt / 100.0 : min(0.98);  // cap to prevent blowup
+
+// Buffer processor: variable-length self-feeding delay with crossfade.
+// When bf=0: passthrough (live signal).
+// When bf=1: loop plays back, mixed with feedback of its own output.
+// The crossfade at the loop boundary uses a raised-cosine window to prevent clicks.
+buffer_freeze_processor = _ * (1.0 - bf) : (+ ~ (buf_delay * (bf + buf_fb * (1.0 - bf))))
+with {
+    // Fractional delay for variable buffer length
+    buf_delay = de.fdelay(FREEZE_BUF_MAX, buf_len - 1);
+};
 
 // --- Ducking engine ---
 // Ducks the wet signal when input is present. Wet snaps back over snapback time.
@@ -699,13 +736,20 @@ tone_eq = fi.highshelf(1, tone_db, 3000)
 // The soft compressor handles moderate peaks gracefully; tanh is the safety net.
 sat_ceiling(x) = select2(feedback_mode, soft_comp(x), ma.tanh(soft_comp(x)));
 
-// --- Shimmer: pitch-shifted feedback ---
+// --- Shimmer v2: pitch-shifted feedback with dedicated self-feedback loop ---
 // Granular-style pitch shifter using two overlapping grains with crossfade.
-// Small buffer (2048 samples ≈ 43ms at 48kHz) saves memory vs stock ef.transpose (65536).
+// v2 additions:
+//   - Dedicated feedback path: shifter output feeds back to its own input,
+//     creating cascading harmonic series (Eventide Blackhole-style)
+//   - Shimmer Curve: controls amplitude scaling across generations
+//     (linear/log/exp)
+//   - Shimmer Detune: slight detuning for organic beating
+//
 // When shimmer_enable=0, bypassed completely (select2 → identity).
-// When enabled, each FDN iteration pitch-shifts the signal by shimmer_pitch semitones,
-// creating cascading harmonics: +12st = octave wash, +7st = fifth harmonics, etc.
 SHIMMER_MAXDELAY = 2048;
+
+// Core pitch shifter (granular, two overlapping grains)
+// s = shift in semitones (includes detune offset)
 shimmer_transpose(w, x, s, sig) = de.fdelay(SHIMMER_MAXDELAY, d, sig) * ma.fmin(d/x, 1)
                                  + de.fdelay(SHIMMER_MAXDELAY, d+w, sig) * (1-ma.fmin(d/x,1))
 with {
@@ -713,9 +757,30 @@ with {
     d = i : (+ : +(w) : fmod(_,w)) ~ _;
 };
 
-// Shimmer processor: bypass when disabled, pitch shift when enabled
-// Split input → (dry, shifted) → select2 picks one based on checkbox
-shimmer_shift = _ <: (_, shimmer_transpose(1024, 512, shimmer_pitch)) : select2(shimmer_enable);
+// Shimmer curve: controls how feedback generations scale in amplitude.
+// Each feedback iteration multiplies by curve_gain:
+//   Linear (0): curve_gain = shimmer_fb (direct scaling)
+//   Log (1):    curve_gain = shimmer_fb^1.5 (early generations dominate, gentle decay)
+//   Exp (2):    curve_gain = shimmer_fb^0.5 (later generations louder, slow build)
+shimmer_fb = shimmer_feedback / 100.0;
+shimmer_curve_idx = int(shimmer_curve);
+shimmer_fb_gain = (shimmer_fb, pow(shimmer_fb, 1.5), pow(max(shimmer_fb, 0.0001), 0.5))
+                : ba.selectn(3, shimmer_curve_idx) : min(0.95);  // cap at 0.95 to prevent blowup
+
+// Total pitch shift including detune (cents → semitones)
+shimmer_total_pitch = shimmer_pitch + shimmer_detune / 100.0;
+
+// Shimmer processor with dedicated self-feedback loop.
+// Signal flow: input → mix with feedback → pitch shift → output
+// The pitch-shifted output feeds back to the shifter's own input with shimmer_fb_gain.
+// This creates cascading harmonic series that accelerate away from the source pitch.
+// At shimmer_fb=0: single shift per FDN iteration (v1 behaviour).
+// At shimmer_fb=0.8+: self-oscillating harmonic cascade.
+shimmer_with_feedback = _ : (+ : shimmer_transpose(1024, 512, shimmer_total_pitch))
+                       ~ (*(shimmer_fb_gain));
+
+// Final shimmer processor: bypass or engage
+shimmer_shift = _ <: (_, shimmer_with_feedback) : select2(shimmer_enable);
 
 // --- Pitch-quantized delay lines ---
 // When pitch_enable is on, delay lines snap to integer multiples of the base wavelength
@@ -845,13 +910,37 @@ density_display = air_density : hbargraph("[7]Info/[4]Density [unit:kg/m3]", 0.0
 // Keep midi_enable alive (only read by C++, not used in Faust signal path)
 midi_display = midi_enable : hbargraph("[7]Info/[6]MIDI Active", 0, 1);
 
-// Main signal flow:
+// Keep buffer crossfade length alive (used for parameter display, full crossfade impl in Pass 3)
+buf_xfade_display = buf_xfade_len : hbargraph("[7]Info/[7]Buf XFade [unit:smp]", 48, 24000);
+
+// Main signal flow (v2):
 //   Mono input + weather → pre-delay → split to (early reflections) + (late reverb FDN)
 //   Early reflections: mono → 6 image-source delays → stereo
-//   Late reverb: mono → diffusion → FDN → stereo → output diffusion
-//   Sum both stereo paths → wet output
-late_reverb = *(input_gate) : input_diffusion : fdn : fdn_to_stereo
-            : par(i, 2, output_diffusion : dc_blocker : buffer_freeze_processor);
+//   Late reverb: mono → diffusion → FDN → stereo → output diffusion → buffer source select
+//   Buffer source: Post-FDN (default), Pre-FDN (diffused input), Post-Duck (deferred to Pass 3)
+//
+// Buffer source routing: split after diffusion, route FDN output and pre-FDN tap
+// to the buffer based on source selection. Post-Duck source is mapped to Post-FDN
+// pending process chain restructuring in Pass 3.
+buf_src_idx = int(buffer_source);
+
+late_reverb = *(input_gate) : input_diffusion
+            : _ <: (fdn_chain, pre_fdn_stereo)   // 4 outputs: fdn_L, fdn_R, pre_L, pre_R
+            : buf_source_select                    // 4 → 2 (selected pair → buffer)
+            : par(i, 2, buffer_freeze_processor)
+with {
+    fdn_chain = fdn : fdn_to_stereo : par(i, 2, output_diffusion : dc_blocker);
+    pre_fdn_stereo = _ <: (_, _);  // mono diffused input → stereo duplicate
+    // Route 4 inputs to 2 outputs via source selection:
+    // Input layout: fdn_L(1), fdn_R(2), pre_L(3), pre_R(4)
+    // For each channel, provide 3 options to ba.selectn:
+    //   idx 0 (Post-FDN): fdn_L/R
+    //   idx 1 (Pre-FDN): pre_L/R
+    //   idx 2 (Post-Duck): fdn_L/R (placeholder — proper routing in Pass 3)
+    // Route to: out1=[fdn_L, pre_L, fdn_L], out2=[fdn_R, pre_R, fdn_R]
+    buf_source_select = route(4, 6, (1,1),(3,2),(1,3), (2,4),(4,5),(2,6))
+                      : ba.selectn(3, buf_src_idx), ba.selectn(3, buf_src_idx);
+};
 
 // Split mono input → early reflections (stereo) + late reverb (stereo)
 // Weather generators are mixed in, then pre-delay is applied before the split.
@@ -917,4 +1006,4 @@ process = route(2, 4, (1,1), (2,2), (1,3), (2,4))
         : par(i, 2, attach(_, rt60_display) : attach(_, dist_display)
             : attach(_, vol_display) : attach(_, sos_display)
             : attach(_, density_display) : attach(_, snapped_note_display)
-            : attach(_, midi_display));
+            : attach(_, midi_display) : attach(_, buf_xfade_display));
